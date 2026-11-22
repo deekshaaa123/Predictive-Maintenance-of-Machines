@@ -1,0 +1,191 @@
+# ---------- Import libraries ----------
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+from xgboost import XGBClassifier
+from sklearn.metrics import (accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, ConfusionMatrixDisplay, RocCurveDisplay)
+
+# ================= PART 1: MACHINE DOWNTIME DATASET =================
+# ---------- Loading the data ----------
+down = pd.read_csv('machine_downtime.csv')
+down.columns = down.columns.str.strip()      # remove hidden spaces in column names
+print(down.shape)
+print(down.head())
+# ---------- Data types and missing values ----------
+down.info()
+print(down.isna().sum())                     # missing values in each column
+# ---------- Basic statistics ----------
+# checking min and max values for anything that looks wrong (like negative pressure)
+print(down.describe().T)
+
+# ---------- Failure vs no failure ----------
+print(down['Downtime'].value_counts(normalize=True))
+# ---------- Cleaning the data ----------
+# convert the Date column to proper dates
+down['Date'] = pd.to_datetime(down['Date'], dayfirst=True, errors='coerce')
+print(down['Date'].isna().sum())             # should be 0
+# make the target 0/1 (1 = machine failure)
+down['target'] = (down['Downtime'] == 'Machine_Failure').astype(int)
+print(down['target'].value_counts())
+# pressure, speed and vibration can't be 0 or negative, so treat those as missing
+cols = [c for c in down.columns
+        if any(k in c for k in ['Pressure', 'Spindle_Speed', 'Vibration'])]
+print(cols)                                  # check that all 6 were found
+for c in cols:
+    down.loc[down[c] <= 0, c] = None
+# fill missing values with the median of each machine
+num_cols = down.select_dtypes(include='number').columns.drop('target')
+for c in num_cols:
+    down[c] = down.groupby('Machine_ID')[c].transform(lambda x: x.fillna(x.median()))
+# if anything is still missing, use the median of the whole column
+down[num_cols] = down[num_cols].fillna(down[num_cols].median())
+print(down.isna().sum().sum())               # should be 0
+# ---------- Train/test split ----------
+# columns that are not sensor readings, so they are not features
+drop_cols = ['Date', 'Machine_ID', 'Assembly_Line_No', 'Downtime', 'target']
+features = [c for c in down.columns if c not in drop_cols]
+print(features)
+# sort by date so the oldest rows come first
+down = down.sort_values('Date').reset_index(drop=True)
+# first 80% of rows for training, last 20% for testing
+cut = int(len(down) * 0.8)
+train = down.iloc[:cut]
+test = down.iloc[cut:]
+X_train = train[features]
+y_train = train['target']
+X_test = test[features]
+y_test = test['target']
+print('train:', X_train.shape, ' test:', X_test.shape)
+print('train failure rate:', y_train.mean())
+print('test failure rate :', y_test.mean())
+
+# ---------- Training the models ----------
+# logistic regression needs scaled data, so I put a scaler in front of it
+models = {
+    'Logistic Regression': make_pipeline(StandardScaler(), LogisticRegression(max_iter=2000)),
+    'Random Forest': RandomForestClassifier(n_estimators=300, random_state=42),
+    'XGBoost': XGBClassifier(n_estimators=300, learning_rate=0.05, max_depth=4, random_state=42)}
+for name, m in models.items():
+    m.fit(X_train, y_train)
+    print(name, 'trained')
+
+# test the models and make a results table
+results = {}
+for name, m in models.items():
+    pred = m.predict(X_test)
+    prob = m.predict_proba(X_test)[:, 1]
+    results[name] = {
+        'Accuracy': accuracy_score(y_test, pred),
+        'Precision': precision_score(y_test, pred),
+        'Recall': recall_score(y_test, pred),
+        'F1': f1_score(y_test, pred),
+        'ROC-AUC': roc_auc_score(y_test, prob)}
+results_df = pd.DataFrame(results).T.round(3)
+print(results_df)
+# ---------- Comparing the models ----------
+# bar chart of the results table
+results_df.plot(kind='bar', figsize=(10, 5))
+plt.title('Model comparison')
+plt.ylabel('score')
+plt.ylim(0, 1)
+plt.xticks(rotation=0)
+plt.legend(loc='lower right')
+plt.show()
+# confusion matrices
+fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+for ax, (name, m) in zip(axes, models.items()):
+    ConfusionMatrixDisplay.from_estimator(m, X_test, y_test, ax=ax, colorbar=False,
+                                          display_labels=['No failure', 'Failure'])
+    ax.set_title(name)
+plt.tight_layout()
+plt.show()
+# ROC curves
+fig, ax = plt.subplots(figsize=(6, 5))
+for name, m in models.items():
+    RocCurveDisplay.from_estimator(m, X_test, y_test, ax=ax, name=name)
+ax.plot([0, 1], [0, 1], 'k--')               # the diagonal line = random guessing
+ax.set_title('ROC curves')
+plt.show()
+
+# ---------- Which sensors matter most? ----------
+# the random forest tells us how much each sensor helped its predictions
+rf = models['Random Forest']
+imp = pd.Series(rf.feature_importances_, index=features).sort_values()
+imp.plot(kind='barh', figsize=(8, 6))
+plt.title('Feature importance (Random Forest)')
+plt.xlabel('importance')
+plt.show()
+# ================= PART 2: AI4I 2020 DATASET =================
+# ---------- Loading and first look ----------
+ai4i = pd.read_csv('ai4i2020.csv')
+print(ai4i.shape)
+print(ai4i.head())
+
+# ---------- Missing values and class balance ----------
+print(ai4i.isna().sum().sum())               # total missing values
+print(ai4i['Machine failure'].value_counts(normalize=True))   # only about 3% failures
+# ---------- Cleaning ----------
+# xgboost does not accept [ ] in column names, so remove them
+ai4i.columns = ai4i.columns.str.replace(r'[\ [\]<]', '', regex=True)
+# id columns are not useful, and the failure-type columns give away the answer
+ai4i = ai4i.drop(columns=['UDI', 'Product ID', 'TWF', 'HDF', 'PWF', 'OSF', 'RNF'])
+# Type is L / M / H, convert to numbers
+ai4i = pd.get_dummies(ai4i, columns=['Type'], drop_first=True)
+print(ai4i.head())
+# ---------- Train/test split ----------
+# no dates in this dataset, so I used a random split
+# stratify keeps the same share of failures in train and test
+X2 = ai4i.drop(columns=['Machine failure'])
+y2 = ai4i['Machine failure']
+X2_train, X2_test, y2_train, y2_test = train_test_split(
+    X2, y2, test_size=0.2, stratify=y2, random_state=42)
+print(X2_train.shape, X2_test.shape)
+print(y2_train.mean(), y2_test.mean())       # both should be about 0.03
+# ---------- Training the models (AI4I) ----------
+# failures are only about 3%, so class weights are used
+ratio = (y2_train == 0).sum() / (y2_train == 1).sum()
+models2 = {
+    'Logistic Regression': make_pipeline(StandardScaler(),
+                           LogisticRegression(max_iter=2000, class_weight='balanced')),
+    'Random Forest': RandomForestClassifier(n_estimators=300, class_weight='balanced', random_state=42),
+    'XGBoost': XGBClassifier(n_estimators=300, learning_rate=0.05, max_depth=4,
+                             scale_pos_weight=ratio, random_state=42)}
+for name, m in models2.items():
+    m.fit(X2_train, y2_train)
+    print(name, 'trained')
+# results table
+results2 = {}
+for name, m in models2.items():
+    pred = m.predict(X2_test)
+    prob = m.predict_proba(X2_test)[:, 1]
+    results2[name] = {
+        'Accuracy': accuracy_score(y2_test, pred),
+        'Precision': precision_score(y2_test, pred),
+        'Recall': recall_score(y2_test, pred),
+        'F1': f1_score(y2_test, pred),
+        'ROC-AUC': roc_auc_score(y2_test, prob)}
+results2_df = pd.DataFrame(results2).T.round(3)
+print(results2_df)
+# confusion matrices
+fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+for ax, (name, m) in zip(axes, models2.items()):
+    ConfusionMatrixDisplay.from_estimator(m, X2_test, y2_test, ax=ax, colorbar=False,
+                                          display_labels=['No failure', 'Failure'])
+    ax.set_title(name)
+plt.tight_layout()
+plt.show()
+# important sensors
+imp2 = pd.Series(models2['Random Forest'].feature_importances_,
+                 index=X2.columns).sort_values()
+imp2.plot(kind='barh', figsize=(8, 5))
+plt.title('Feature importance - AI4I (Random Forest)')
+plt.show()
+# ================= FINAL COMPARISON OF BOTH DATASETS =================
+print('Part 1: Machine downtime')
+print(results_df)
+print('\nPart 2: AI4I 2020')
+print(results2_df)
